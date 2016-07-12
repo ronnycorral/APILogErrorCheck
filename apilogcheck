@@ -1,0 +1,300 @@
+#!/usr/bin/python -u
+'''
+This script reads log files from Digital Services servers and looks for text that is found in a config file. If a number of the threshold is found an alert is created
+
+6/25/16 - converted script to connect directly to DB when security group shut down ACL to API for security concerns
+'''
+
+import sys
+import re
+import os
+import time
+import datetime
+import calendar
+from optparse import OptionParser
+import string
+import signal
+#import urllib
+#import urllib2
+import MySQLdb
+
+errorCount = 0
+errorLine = ''
+baseDir = "/var/log/syslog/HOSTS/"
+current_epoch_time = calendar.timegm(time.gmtime())
+startup_date_time = datetime.datetime.fromtimestamp(current_epoch_time).strftime('%Y-%m-%d %H:%M:%S')
+#current_log_date = datetime.datetime.fromtimestamp(current_epoch_time).strftime('%Y/%m/%d')
+current_log_date = datetime.datetime.utcnow().strftime('%Y/%m/%d')
+
+print "apilogcheck started: " + startup_date_time
+print "current_log_date: " + current_log_date
+
+usage = "usage: %prog -i ip-10.x.x.x -a APIName [-m num]"
+
+parser = OptionParser(usage=usage)
+
+parser.add_option("-i", "--ip", type="str", default=False, 
+                  help="ip address directory (required)",
+                  dest="ip_address_directory")
+
+parser.add_option("-a", "--api", type="str", default=False, 
+                  help="api directory (required)",
+                  dest="api_directory")
+
+parser.add_option("-m", "--minutes", type="int",
+                  help="number of minutes we're going back (default=5)",
+                  dest="minutes")
+
+(options, args) = parser.parse_args()
+
+if not options.ip_address_directory:
+    parser.error('IP Address directory not given')
+
+ip_address_directory = options.ip_address_directory
+
+if not options.api_directory:
+    parser.error('API directory not given')
+
+api_directory = options.api_directory
+
+minutes = 5
+if options.minutes:
+   minutes = options.minutes
+
+logFile = baseDir + current_log_date + "/" + api_directory + "/" + ip_address_directory + "/user.log"
+
+#confFile = sys.path[0] + "/conf/apilogerrors.conf"
+confFile = sys.path[0] + "/conf/" + os.path.basename(sys.argv[0]) + ".conf"
+if not os.path.isfile(confFile):
+    print "config file does not exist: " + confFile
+    sys.exit(1)
+elif not os.access(confFile, os.R_OK):
+    print "config file is not readable: " + confFile
+    sys.exit(2)
+
+try:
+   config_file = open( confFile, "r" )
+except:
+   print "Could not open config file: " + config_file
+   sys.exit(3)
+
+grepArray = {}
+for confLine in config_file:
+   if confLine[:1] == '#':
+      continue
+   (api,confErrorCount,grepPatterns) = confLine.rstrip().split(':',2)
+   if api != options.api_directory :
+      continue
+   for x in grepPatterns.split(','):
+      grepArray[x] = 0
+   break
+
+if not len(grepArray):
+   print "API not found in config file or no search words defind: " + options.api_directory
+   sys.exit(1)
+
+print "Service: " + api
+print "confErrorCount: " + confErrorCount
+for key in grepArray:
+   print "grep item is: " + key
+
+def awsNameToRealIP(awsName):
+   return awsName[3:].replace('-','.')
+
+def signal_handler(signal, frame):
+        i = datetime.datetime.now()
+        print('signal caught! %d shutting down. %s' % (signal,i))
+        sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGQUIT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+class tail:
+	def __init__(self, filename, callback, tailbytes = 0):
+		self.skip = tailbytes
+		self.filename = filename
+		self.callback = callback
+		self.fp = None
+		self.lastSize = 0
+		self.lastInode = -1
+		self.data = ''
+
+	def process(self):
+                if not os.path.isfile(self.filename):
+                   print "no file so exiting"
+                   sys.exit(0)
+		#  open file if it's not already open
+		if not self.fp:
+			try:
+				self.fp = open(self.filename, 'r')
+				stat = os.stat(self.filename)
+				self.lastIno = stat[1]
+				if self.skip >= 0 and stat[6] > self.skip:
+					self.fp.seek(0 - (self.skip), 2)
+				self.skip = -1
+				self.lastSize = 0
+			except:
+				if self.fp: self.fp.close()
+				self.skip = -1    #  if the file doesn't exist, we don't skip
+				self.fp = None
+		if not self.fp: return
+
+		#  check to see if file has moved under us
+		try:
+			stat = os.stat(self.filename)
+			thisSize = stat[6]
+			thisIno = stat[1]
+			if thisSize < self.lastSize or thisIno != self.lastIno:
+				raise Exception
+		except:
+			self.fp.close()
+			self.fp = None
+			self.data = ''
+			return
+
+		#  read if size has changed
+		if self.lastSize < thisSize:
+			while 1:
+				#thisData = self.fp.read(4096)
+				thisData = self.fp.readline()
+				if len(thisData) < 1:
+					break
+				self.data = self.data + thisData
+
+				#  process lines within the data
+				while 1:
+					pos = string.find(self.data, '\n')
+					if pos < 0: break
+					line = self.data[:pos]
+					self.data = self.data[pos + 1:]
+					#  line is line read from file
+					if self.callback: self.callback(line)
+
+		self.lastSize = thisSize
+		self.lastIno = thisIno
+
+	def mainloop(self, sleepfor = 15):
+                global errorCount
+                global errorLine
+                global current_log_date
+                global api_directory
+                global ip_address_directory
+                global logFile
+                #global curr
+                global minutes
+                maxloop = minutes * 4
+                loopcount = 0
+		while 1:
+			self.process()
+                        #print maxloop
+                        #print loopcount
+                        current_utc_date = datetime.datetime.utcnow().strftime('%Y/%m/%d')
+                        if current_log_date != current_utc_date:
+                           print "date has changed, exiting"
+                           sys.exit(0)
+                       
+                        if loopcount >= maxloop:
+                           current_date_time = datetime.datetime.fromtimestamp(calendar.timegm(time.gmtime())).strftime('%Y-%m-%d %H:%M:%S')
+                           print('finished read loop %s' % (current_date_time))
+                           print "errorCount: " + str(errorCount)
+                           print "confErrorCount: " + str(confErrorCount)
+                           if int(errorCount) and int(errorCount) >= int(confErrorCount):
+                              payload = "Service: " + api_directory + "\n"
+                              payload += "IP: " + awsNameToRealIP(ip_address_directory) + "\n"
+                              payload += "Log file: " + logFile + "\n"
+                              for key in grepArray:
+                                 payload +=  "Error count for " + key + ": " + str(grepArray[key]) + "\n"
+                              payload += "Error Lines:\n" + errorLine + "\n"
+                              #alertUrl = 'http://availability.bhnetwork.com/api/insert_alert.php'
+                              alertMessage = "Errors found in " + api_directory + "(" + awsNameToRealIP(ip_address_directory) + ") log: " + str(errorCount)
+                              platform = "Digital Services"
+                              entityType = "Digital Service"
+                              #alertMessage = "Errors found in " + api_directory + " syslog"
+                              print alertMessage
+                              #alertData = urllib.urlencode({'entity_name' : api_directory , 'platform' : 'Digital Services', 'message' : alertMessage , 'entity_type'  : 'Digital Service' , 'payload'  : payload})
+                              #alertReq = urllib2.Request(alertUrl, alertData)
+                              #alertResponse = urllib2.urlopen(alertReq)
+                              #print alertResponse.read()
+                              try:
+                                 db = MySQLdb.connect(host="xxxxx",
+                                                   user="xxxxx",
+                                                   passwd="xxxxx",
+                                                   db="xxxxx")
+                                 cur = db.cursor()
+                              except:
+                                 print "Could not connect to database"
+                                 sys.exit(10)
+
+                              #create sql here
+
+                              selectSql = "SELECT count(*) as cnt FROM dashboard_alerts WHERE alert_platform = %s AND alert_entity_name = %s AND alert_ack_time = '0000-00-00 00:00:00'"
+
+                              updateSql = "UPDATE dashboard_alerts SET alert_last_time = NOW(), alert_count = alert_count + 1, alert_message = %s WHERE alert_platform = %s AND alert_entity_name = %s AND alert_ack_time = '0000-00-00 00:00:00'"
+
+                              insertSql = "INSERT INTO dashboard_alerts (alert_platform,alert_entity_name,alert_entity_type,alert_message,alert_payload) VALUES(%s,%s,%s,%s,%s)"
+
+                              try:
+                                 cur.execute(selectSql,(platform,api_directory))
+                                 alertResults = cur.fetchall()
+                              except MySQLdb.Error, e:
+                                 try:
+                                   print "MySQL Error [%d]: %s" % (e.args[0], e.args[1])
+                                   print "Unable to execute following SQL statement: " + sqlline
+                                 except IndexError:
+                                   print "MySQL Error: %s" % str(e)
+                                   print "Unable to execute following SQL statement: " + sqlline
+
+                              for row in alertResults:
+                                 if row[0] == 0:
+                                    print "about to try insert"
+                                    try:
+                                       cur.execute(insertSql,(platform,api_directory,entityType,alertMessage,payload))
+                                    except MySQLdb.Error, e:
+                                       try:
+                                         print "MySQL Error [%d]: %s" % (e.args[0], e.args[1])
+                                         print "Unable to execute following SQL statement: " + sqlline
+                                       except IndexError:
+                                         print "MySQL Error: %s" % str(e)
+                                         print "Unable to execute following SQL statement: " + sqlline
+                                 else:
+                                    print "about to try update"
+                                    try:
+                                       cur.execute(updateSql,(alertMessage,platform,api_directory))
+                                    except MySQLdb.Error, e:
+                                       try:
+                                         print "MySQL Error [%d]: %s" % (e.args[0], e.args[1])
+                                         print "Unable to execute following SQL statement: " + sqlline
+                                       except IndexError:
+                                         print "MySQL Error: %s" % str(e)
+                                         print "Unable to execute following SQL statement: " + sqlline
+
+
+
+                              db.commit()
+                              db.close()
+
+
+                           errorCount = 0
+                           errorLine = '' 
+                           for key in grepArray:
+                              grepArray[key] = 0
+                           loopcount = 0
+                        loopcount += 1
+			time.sleep(sleepfor)
+
+if __name__ == "__main__":
+	def callback(line):
+                global errorCount
+                global errorLine
+                global grepArray
+                for key in grepArray:
+                   m = re.search(key, line)
+                   if m:
+                      grepArray[key] = grepArray[key] + 1
+                      errorCount += 1
+                      errorLine += line + '\n'
+                      print "found " + key + " in " + line
+                
+
+	tail(logFile, callback).mainloop()
